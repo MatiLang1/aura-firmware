@@ -6,7 +6,11 @@
  * medición por la mesh; la conexión, el aula, la cola y la confirmación de AURA las resuelve
  * la biblioteca nodo_mesh.
  *
- *   values: {"presencia": true, "conf_pct": 72}
+ *   values: {"presencia": 1, "conf_pct": 72}     (1 = hay personas, 0 = no hay; igual que LUZ01)
+ *
+ * Cuándo publica: en cada cambio y, si no cambia nada, cada intervalo_s (300 s por defecto).
+ * El paso a "no hay personas" espera delay_off_s (30 s por defecto) con la Pi diciendo P0 todo
+ * ese tiempo: si alguien sale de cuadro unos segundos, no se publica un 0 falso.
  *
  * Sin dato falso (contrato §3.1): si la Pi avisa que la cámara no da una lectura confiable
  * ("U"), o pasa PI_TIMEOUT_S sin recibir una línea válida, NO se publica medición; la falla se
@@ -22,7 +26,8 @@
  *            Pi GPIO15 RXD (pin 10) <- C3 GPIO5 (TX)   (no se usa hoy, queda cableado)
  *            Pi GND (pin 6)         -- C3 GND
  *
- * Configuración remota (set_config): intervalo_s (2 a 3600 s), validado y guardado en NVS.
+ * Configuración remota (set_config): intervalo_s (30 a 3600 s) y delay_off_s (0 a 600 s),
+ * validados y guardados en NVS.
  * MESH_ID y MESH_AP_PASS: en config_local.h (lo da la cátedra, no se sube).
  */
 #include <stdint.h>
@@ -58,13 +63,16 @@
 #define LINEA_MAX           32
 #define PI_TIMEOUT_S        30                 /* sin líneas válidas en este tiempo = sensor sin respuesta */
 
-#define INTERVALO_DEFECTO_S 10
-#define INTERVALO_MIN_S     2
+#define INTERVALO_DEFECTO_S 300                /* sin cambios, una medición cada 5 min */
+#define INTERVALO_MIN_S     30
 #define INTERVALO_MAX_S     3600
+#define DELAY_OFF_DEFECTO_S 30                 /* P0 sostenido antes de publicar "no hay personas" */
+#define DELAY_OFF_MIN_S     0
+#define DELAY_OFF_MAX_S     600
 
 static const char *TAG = "PRESENCIA";
 static volatile uint32_t intervalo_s = INTERVALO_DEFECTO_S;
-static volatile bool medir_ya = false;
+static volatile uint32_t delay_off_s = DELAY_OFF_DEFECTO_S;
 
 /* Último estado recibido de la Pi. Se protege con un mutex porque lo escribe la tarea del
    UART y lo lee la de medición. */
@@ -93,8 +101,7 @@ static void procesar_linea(const char *linea)
     estado.recibido = (ahora == 0) ? 1 : ahora;    /* 0 queda reservado para "nunca" */
     xSemaphoreGive(mutex_estado);
     if (cambio) {
-        ESP_LOGI(TAG, "Pi: %s", linea);
-        medir_ya = true;       /* que AURA vea el cambio ya, sin esperar el intervalo */
+        ESP_LOGI(TAG, "Pi: %s", linea);   /* la tarea de medición lo ve en <= 100 ms */
     }
 }
 
@@ -139,23 +146,45 @@ static bool entero_en_rango(const cJSON *item, double min, double max)
            && item->valuedouble >= min && item->valuedouble <= max;
 }
 
+/* Guarda un u32 en NVS; false si no se pudo. */
+static bool nvs_guardar(nvs_handle_t h, const char *clave, uint32_t valor)
+{
+    return nvs_set_u32(h, clave, valor) == ESP_OK;
+}
+
 /* Valida TODO antes de aplicar algo (contrato §3.3). "aula" la maneja la biblioteca. */
 static bool aplicar_config(const cJSON *params, char *motivo, size_t tam)
 {
+    /* params tiene que ser un objeto: un arreglo ("params":[10]) no trae nombres de campo y
+       p->string sería NULL (igual que el modelo PUE-RFID). */
+    if (!cJSON_IsObject(params)) {
+        snprintf(motivo, tam, "params_invalido");
+        return false;
+    }
     const cJSON *p;
     cJSON_ArrayForEach(p, params) {
-        if (strcmp(p->string, "intervalo_s") != 0 && strcmp(p->string, "aula") != 0) {
+        if (p->string == NULL) {
+            snprintf(motivo, tam, "params_invalido");
+            return false;
+        }
+        if (strcmp(p->string, "intervalo_s") != 0 && strcmp(p->string, "delay_off_s") != 0
+            && strcmp(p->string, "aula") != 0) {
             snprintf(motivo, tam, "parametro_desconocido");
             return false;
         }
     }
     const cJSON *iv = cJSON_GetObjectItemCaseSensitive(params, "intervalo_s");
-    if (iv == NULL) {
-        return true;               /* solo aula: la maneja la biblioteca */
-    }
-    if (!entero_en_rango(iv, INTERVALO_MIN_S, INTERVALO_MAX_S)) {
+    const cJSON *dof = cJSON_GetObjectItemCaseSensitive(params, "delay_off_s");
+    if (iv != NULL && !entero_en_rango(iv, INTERVALO_MIN_S, INTERVALO_MAX_S)) {
         snprintf(motivo, tam, "intervalo_s_fuera_de_rango");
         return false;
+    }
+    if (dof != NULL && !entero_en_rango(dof, DELAY_OFF_MIN_S, DELAY_OFF_MAX_S)) {
+        snprintf(motivo, tam, "delay_off_s_fuera_de_rango");
+        return false;
+    }
+    if (iv == NULL && dof == NULL) {
+        return true;               /* solo aula: la maneja la biblioteca */
     }
 
     /* Primero se guarda y, solo si se pudo, se aplica: lo que responde la placa es lo que va a
@@ -165,23 +194,29 @@ static bool aplicar_config(const cJSON *params, char *motivo, size_t tam)
         snprintf(motivo, tam, "error_de_nvs");
         return false;
     }
-    esp_err_t err = nvs_set_u32(h, "intervalo_s", (uint32_t)iv->valuedouble);
-    if (err == ESP_OK) {
-        err = nvs_commit(h);
-    }
+    bool ok = (iv == NULL || nvs_guardar(h, "intervalo_s", (uint32_t)iv->valuedouble))
+              && (dof == NULL || nvs_guardar(h, "delay_off_s", (uint32_t)dof->valuedouble))
+              && nvs_commit(h) == ESP_OK;
     nvs_close(h);
-    if (err != ESP_OK) {
+    if (!ok) {
         snprintf(motivo, tam, "error_de_nvs");
         return false;
     }
-    intervalo_s = (uint32_t)iv->valuedouble;
-    ESP_LOGI(TAG, "Nuevo intervalo: %lu s", (unsigned long)intervalo_s);
+    if (iv != NULL) {
+        intervalo_s = (uint32_t)iv->valuedouble;
+    }
+    if (dof != NULL) {
+        delay_off_s = (uint32_t)dof->valuedouble;
+    }
+    ESP_LOGI(TAG, "Config: intervalo_s %lu, delay_off_s %lu", (unsigned long)intervalo_s,
+             (unsigned long)delay_off_s);
     return true;
 }
 
 static void describir_config(cJSON *config)
 {
     cJSON_AddNumberToObject(config, "intervalo_s", intervalo_s);
+    cJSON_AddNumberToObject(config, "delay_off_s", delay_off_s);
 }
 
 static void led_aplicar(bool encendido)
@@ -190,38 +225,71 @@ static void led_aplicar(bool encendido)
 }
 
 /* ---------- Medición ---------- */
+
+/* Estado publicado: -1 = nada todavía (o se perdió la Pi), 0 = no hay personas, 1 = hay. */
 static void tarea_medicion(void *arg)
 {
-    TickType_t ultima = 0;
+    int efectivo = -1;             /* presencia después del retardo de apagado */
+    int publicado = -1;            /* lo último que se mandó a AURA */
+    TickType_t ultima_pub = 0;     /* tick de la última publicación */
+    TickType_t p0_desde = 0;       /* desde cuándo la Pi dice P0 sin cortar; 0 = no está en P0 */
+    int ok_anterior = -1;
+
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(100));
-        if (!medir_ya && ultima != 0 && (xTaskGetTickCount() - ultima) < pdMS_TO_TICKS(intervalo_s * 1000)) {
-            continue;
-        }
-        medir_ya = false;
-        ultima = xTaskGetTickCount();
+        TickType_t ahora = xTaskGetTickCount();
 
         xSemaphoreTake(mutex_estado, portMAX_DELAY);
         estado_pi_t e = estado;
         xSemaphoreGive(mutex_estado);
 
-        bool vigente = e.recibido != 0 && (ultima - e.recibido) < pdMS_TO_TICKS(PI_TIMEOUT_S * 1000);
+        bool vigente = e.recibido != 0 && (ahora - e.recibido) < pdMS_TO_TICKS(PI_TIMEOUT_S * 1000);
         bool ok = vigente && e.linea.confiable;
 
         /* La alerta "sensor" sale solo cuando cambia (la biblioteca lo controla). */
-        nodo_mesh_sonda("presencia", ok, "sin_respuesta");
-        led_aplicar(ok && e.linea.presencia);
+        if ((int)ok != ok_anterior) {
+            nodo_mesh_sonda("presencia", ok, "sin_respuesta");
+            ok_anterior = ok;
+        }
         if (!ok) {
-            continue;              /* sin dato falso: no se publica medición */
+            /* Sin dato falso: no se publica nada. Al volver la Pi se publica enseguida. */
+            efectivo = publicado = -1;
+            p0_desde = 0;
+            led_aplicar(false);
+            continue;
+        }
+
+        /* Retardo de apagado: 1 enseguida; 0 solo después de delay_off_s seguidos en P0
+           (o enseguida si todavía no se publicó nada). */
+        if (e.linea.presencia) {
+            efectivo = 1;
+            p0_desde = 0;
+        } else {
+            if (p0_desde == 0) {
+                p0_desde = (ahora == 0) ? 1 : ahora;
+            }
+            if (efectivo != 0 && (efectivo == -1 || (ahora - p0_desde) >= pdMS_TO_TICKS(delay_off_s * 1000))) {
+                efectivo = 0;
+            }
+        }
+        led_aplicar(efectivo == 1);
+
+        bool cambio = efectivo != publicado;
+        bool toca = (ahora - ultima_pub) >= pdMS_TO_TICKS(intervalo_s * 1000);
+        if (!cambio && !toca) {
+            continue;
         }
 
         cJSON *v = cJSON_CreateObject();
-        cJSON_AddBoolToObject(v, "presencia", e.linea.presencia);
-        if (e.linea.conf_pct >= 0) {
+        cJSON_AddNumberToObject(v, "presencia", efectivo);
+        /* conf_pct solo si es de la misma lectura (durante el retardo la Pi ya dice P0) */
+        if (e.linea.conf_pct >= 0 && (int)e.linea.presencia == efectivo) {
             cJSON_AddNumberToObject(v, "conf_pct", e.linea.conf_pct);
         }
         nodo_mesh_medicion(v);
         cJSON_Delete(v);
+        publicado = efectivo;
+        ultima_pub = ahora;
     }
 }
 
@@ -243,6 +311,9 @@ void app_main(void)
         uint32_t v;
         if (nvs_get_u32(h, "intervalo_s", &v) == ESP_OK && v >= INTERVALO_MIN_S && v <= INTERVALO_MAX_S) {
             intervalo_s = v;
+        }
+        if (nvs_get_u32(h, "delay_off_s", &v) == ESP_OK && v <= DELAY_OFF_MAX_S) {
+            delay_off_s = v;
         }
         nvs_close(h);
     }
