@@ -1,5 +1,5 @@
 /*
- * E1-PB-LECA-PRE01 — Hoja de presencia por cámara (proyecto MCCV, IC IV 2026).
+ * E1-PB-LECA-PRP01 — Hoja de presencia por cámara (proyecto MCCV, IC IV 2026).
  *
  * La detección la hace una Raspberry Pi con cámara. La Pi le manda a esta hoja, por UART,
  * una línea de texto con el estado (ver "Protocolo con la Pi" abajo). La hoja publica la
