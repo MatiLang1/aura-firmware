@@ -15,6 +15,8 @@
  * Sin dato falso (contrato §3.1): si la Pi avisa que la cámara no da una lectura confiable
  * ("U"), o pasa PI_TIMEOUT_S sin recibir una línea válida, NO se publica medición; la falla se
  * informa con la alerta "sensor" (motivo sin_respuesta) y, cuando vuelve, "recuperada".
+ * Al arrancar, la sonda no se evalúa hasta PI_TIMEOUT_S si todavía no llegó ninguna línea:
+ * la Pi tiene ese margen para hablar y un reinicio (OTA, corte de luz) no deja alertas falsas.
  *
  * Protocolo con la Pi (115200 8N1, una línea ASCII terminada en \n, la Pi la repite cada 5 s):
  *   "P1 72"  hay personas, confianza 72 %      "P0 90"  no hay personas, confianza 90 %
@@ -45,6 +47,7 @@
 #include "cJSON.h"
 #include "nodo_mesh.h"
 #include "protocolo_pi.h"
+#include "config_validacion.h"     /* copiado de _modelos/PUE-RFID: compara antes de convertir */
 
 #if __has_include("config_local.h")
 #include "config_local.h"
@@ -139,11 +142,12 @@ static void tarea_uart(void *arg)
 
 /* ---------- Lo que aporta el dispositivo a nodo_mesh ---------- */
 
-/* true si item es un número entero entre min y max (2.5 o "10" no valen). */
-static bool entero_en_rango(const cJSON *item, double min, double max)
+/* true si item es un número entero entre min y max (2.5, 1e300 o "10" no valen). La
+   comparación de rango va antes de la conversión (config_validacion.h). */
+static bool param_entero(const cJSON *item, int32_t min, int32_t max)
 {
-    return cJSON_IsNumber(item) && item->valuedouble == (double)(int64_t)item->valuedouble
-           && item->valuedouble >= min && item->valuedouble <= max;
+    int32_t v;
+    return cJSON_IsNumber(item) && entero_en_rango(item->valuedouble, min, max, &v);
 }
 
 /* Guarda un u32 en NVS; false si no se pudo. */
@@ -155,8 +159,9 @@ static bool nvs_guardar(nvs_handle_t h, const char *clave, uint32_t valor)
 /* Valida TODO antes de aplicar algo (contrato §3.3). "aula" la maneja la biblioteca. */
 static bool aplicar_config(const cJSON *params, char *motivo, size_t tam)
 {
-    /* params tiene que ser un objeto: un arreglo ("params":[10]) no trae nombres de campo y
-       p->string sería NULL (igual que el modelo PUE-RFID). */
+    /* Defensa: nodo_mesh ya rechaza con json_invalido un params que no es objeto, así que acá
+       solo llega NULL (falta params). Igual se controla, como el modelo PUE-RFID: en un arreglo
+       ("params":[10]) p->string sería NULL. */
     if (!cJSON_IsObject(params)) {
         snprintf(motivo, tam, "params_invalido");
         return false;
@@ -175,11 +180,11 @@ static bool aplicar_config(const cJSON *params, char *motivo, size_t tam)
     }
     const cJSON *iv = cJSON_GetObjectItemCaseSensitive(params, "intervalo_s");
     const cJSON *dof = cJSON_GetObjectItemCaseSensitive(params, "delay_off_s");
-    if (iv != NULL && !entero_en_rango(iv, INTERVALO_MIN_S, INTERVALO_MAX_S)) {
+    if (iv != NULL && !param_entero(iv, INTERVALO_MIN_S, INTERVALO_MAX_S)) {
         snprintf(motivo, tam, "intervalo_s_fuera_de_rango");
         return false;
     }
-    if (dof != NULL && !entero_en_rango(dof, DELAY_OFF_MIN_S, DELAY_OFF_MAX_S)) {
+    if (dof != NULL && !param_entero(dof, DELAY_OFF_MIN_S, DELAY_OFF_MAX_S)) {
         snprintf(motivo, tam, "delay_off_s_fuera_de_rango");
         return false;
     }
@@ -234,6 +239,8 @@ static void tarea_medicion(void *arg)
     TickType_t ultima_pub = 0;     /* tick de la última publicación */
     TickType_t p0_desde = 0;       /* desde cuándo la Pi dice P0 sin cortar; 0 = no está en P0 */
     int ok_anterior = -1;
+    const TickType_t inicio = xTaskGetTickCount();
+    bool arrancando = true;        /* todavía en el margen de PI_TIMEOUT_S sin ninguna línea */
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -242,6 +249,15 @@ static void tarea_medicion(void *arg)
         xSemaphoreTake(mutex_estado, portMAX_DELAY);
         estado_pi_t e = estado;
         xSemaphoreGive(mutex_estado);
+
+        /* Arranque: hasta que llegue la primera línea, o pasen PI_TIMEOUT_S, la sonda no se
+           evalúa. Si no, la primera vuelta (a los 100 ms) informaría una falla que no es. */
+        if (arrancando) {
+            if (e.recibido == 0 && (ahora - inicio) < pdMS_TO_TICKS(PI_TIMEOUT_S * 1000)) {
+                continue;
+            }
+            arrancando = false;
+        }
 
         bool vigente = e.recibido != 0 && (ahora - e.recibido) < pdMS_TO_TICKS(PI_TIMEOUT_S * 1000);
         bool ok = vigente && e.linea.confiable;

@@ -7,7 +7,7 @@
 | **Estado** | en desarrollo |
 | **Instalado** | todavía no |
 | **Transporte** | mesh ESP-WIFI-MESH (interior), según [ADR-003](../../docs/adr/ADR-003-dos-transportes-mesh-interior-lorawan-exterior.md) y [ADR-007](../../docs/adr/ADR-007-mesh-en-esp-idf-con-concentrador-por-aula.md) |
-| **Contrato que implementa** | [`CONTRATO_MQTT.md`](../../docs/CONTRATO_MQTT.md) v4.4 |
+| **Contrato que implementa** | [`CONTRATO_MQTT.md`](../../docs/CONTRATO_MQTT.md) v4.5 |
 | **Basado en** | [`Mesh_Red_Completa/Mesh3_Hoja`](../../Mesh_Red_Completa/Mesh3_Hoja/) |
 | **Códigos anteriores** | ninguno |
 
@@ -60,7 +60,8 @@ tiempo, como el `delay_off_s` del LUZ01: si alguien sale de cuadro unos segundos
 
 Alertas que emite (contrato §3.5): `sensor` con `campo: presencia` y `motivo: sin_respuesta`
 cuando la Pi manda `U` o pasan 30 s sin una línea válida; `recuperada` cuando vuelve. Una vez
-por cambio (`nodo_mesh_sonda`).
+por cambio (`nodo_mesh_sonda`). Al arrancar, la sonda no se evalúa hasta que llega la primera línea
+o pasan esos 30 s: un reinicio (OTA, corte de luz) no deja alertas.
 
 ## Configuración
 
@@ -72,10 +73,12 @@ Parámetros que acepta `set_config` (contrato §3.3), y el valor que usa esta pl
 | `delay_off_s` | 0 a 600 | 30 |
 
 Cualquier otro parámetro (salvo `aula`, que maneja la biblioteca) se rechaza con
-`parametro_desconocido`; si `params` no es un objeto, con `params_invalido`. Los dos valores tienen
-que ser enteros dentro del rango (si no, `intervalo_s_fuera_de_rango` o `delay_off_s_fuera_de_rango`).
-Los valores se guardan en NVS antes de aplicarse; si no se puede guardar, responde `error_de_nvs` y no
-cambia nada. No acepta comandos propios.
+`parametro_desconocido`. Un `params` que no es un objeto lo rechaza antes `nodo_mesh` con
+`json_invalido`; si falta `params`, la respuesta es `params_invalido`. Los dos valores tienen que ser
+enteros dentro del rango (si no, `intervalo_s_fuera_de_rango` o `delay_off_s_fuera_de_rango`); el rango
+se compara antes de convertir el número (`main/config_validacion.h`, el del modelo PUE-RFID).
+Los valores se guardan en NVS antes de aplicarse; si no se puede guardar,
+responde `error_de_nvs` y no cambia nada. No acepta comandos propios.
 
 ## Compilar y probar
 
@@ -86,7 +89,7 @@ cambia nada. No acepta comandos propios.
    la clave de prueba del grupo (fuera del repo, `Mesh_Red_Completa/GUIA_NODOS_HOJA.md` §2.9):
    `python -m espsecure sign-data --version 2 --keyfile <ruta>/firma_prueba.pem --output build/firmado.bin build/aura-presencia.bin`,
    `mv -f build/firmado.bin build/aura-presencia.bin` y `idf.py -p <puerto> flash monitor`.
-3. Tests de host del protocolo: `make -C tests`.
+3. Tests de host del protocolo y de la validación de `set_config`: `make -C tests`.
 4. Sin la Pi: conectar un adaptador USB-serie a GPIO4/GND y escribir `P1 72` + Enter. En el
    monitor se ve `Pi: P1 72` y, en el broker de banco, `hw/<hw_id>/data` con
    `{"presencia":1,"conf_pct":72}`. Dejar de escribir 30 s → alerta `sensor`.
